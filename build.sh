@@ -1,37 +1,53 @@
 #!/bin/zsh
 # Builds Drain.app next to this script.
-set -e
-cd "$(dirname "$0")"
-swift build -c release
-APP=Drain.app
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
-cp .build/release/Drain "$APP/Contents/MacOS/Drain"
-cat > "$APP/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>CFBundleName</key><string>Drain</string>
-  <key>CFBundleDisplayName</key><string>Drain</string>
-  <key>CFBundleIdentifier</key><string>local.drain.menubar</string>
-  <key>CFBundleExecutable</key><string>Drain</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
-  <key>CFBundleVersion</key><string>1</string>
-  <key>LSMinimumSystemVersion</key><string>15.0</string>
-  <key>LSUIElement</key><true/>
-  <key>NSHighResolutionCapable</key><true/>
-  <key>NSAppleEventsUsageDescription</key><string>Drain asks apps to quit the same way ⌘Q does, so they close cleanly and keep their state.</string>
-</dict></plist>
-PLIST
-codesign --force --sign - "$APP" >/dev/null
-echo "Built $(pwd)/$APP"
+#   ./build.sh            build ./Drain.app
+#   ./build.sh --install  also replace /Applications/Drain.app and relaunch it
+# Signing: DRAIN_SIGN_IDENTITY=<identity or hash> picks one ("-" = ad hoc); otherwise the
+# first "Apple Development" identity in the keychain; otherwise ad hoc.
+set -euo pipefail
+cd "${0:A:h}"
 
-# ./build.sh --install  copies the app to /Applications and restarts it there.
-if [[ "$1" == "--install" ]]; then
+case "${1:-}" in
+  ""|--install) ;;
+  -h|--help) sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) echo "Unknown argument: $1 (try --help)" >&2; exit 2 ;;
+esac
+(( $# <= 1 )) || { echo "Too many arguments (try --help)" >&2; exit 2; }
+
+swift build -c release
+
+APP=Drain.app
+STAGE=Drain.app.new
+rm -rf "$STAGE"
+mkdir -p "$STAGE/Contents/MacOS"
+cp .build/release/Drain "$STAGE/Contents/MacOS/Drain"
+cp Resources/Info.plist "$STAGE/Contents/Info.plist"
+
+# A stable identity keeps the login item and permissions across rebuilds; ad hoc changes every build.
+identity="${DRAIN_SIGN_IDENTITY:-}"
+if [[ -z "$identity" ]]; then
+  found="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+  identity="$(print -r -- "$found" | awk '/"Apple Development/ { print $2; exit }')"
+fi
+if [[ -n "$identity" && "$identity" != "-" ]] && codesign --force --sign "$identity" "$STAGE" >/dev/null 2>&1; then
+  echo "Signed with identity ${identity:0:8}"
+else
+  [[ -z "$identity" || "$identity" == "-" ]] || echo "Signing with identity ${identity:0:8} failed."
+  codesign --force --sign - "$STAGE" >/dev/null 2>&1 || { echo "Ad hoc signing failed." >&2; exit 1; }
+  echo "Signed ad hoc (login item and permissions will not survive rebuilds)"
+fi
+
+rm -rf "$APP"
+mv "$STAGE" "$APP"
+echo "Built $PWD/$APP"
+
+if [[ "${1:-}" == "--install" ]]; then
+  # Copy beside the destination first, so a failure leaves the old app in place.
+  rm -rf /Applications/Drain.app.new
+  ditto "$APP" /Applications/Drain.app.new
   pkill -x Drain || true
   rm -rf /Applications/Drain.app
-  ditto "$APP" /Applications/Drain.app
+  mv /Applications/Drain.app.new /Applications/Drain.app
   open /Applications/Drain.app
   echo "Installed /Applications/Drain.app"
 fi

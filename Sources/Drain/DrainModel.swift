@@ -1,4 +1,5 @@
 import AppKit
+import IOKit.ps
 import SwiftUI
 
 enum PowerState: Equatable {
@@ -33,16 +34,36 @@ struct AppDrain: Identifiable, Equatable {
     }
 }
 
+extension AppDrain: WattsRanked {}
+
+/// A quit Drain has sent but not yet seen happen. The slice and the numbers
+/// already moved (so it feels instant); this is what it takes to undo that.
+private struct PendingQuit {
+    let app: AppDrain
+    let sentAt: Date
+    /// False when DRAIN_ONLY_QUIT refused it, so there is nothing to wait for.
+    let sent: Bool
+    let creditMinutes: Double
+    let creditWatts: Double
+    /// How much `systemWatts` the quit took off, to put back on a rollback.
+    let removedWatts: Double
+    /// Which menu session the credit went into; a later session isn't touched.
+    let epoch: Int
+    var revealed = false
+}
+
 @MainActor
 final class DrainModel: ObservableObject {
     @Published private(set) var state: PowerState = .noBattery
     @Published private(set) var percent = 0
     /// Time left on battery: right now on battery, or if you unplugged now when
-    /// plugged in. nil while unknown.
+    /// plugged in. nil while unknown. Moves at once when an app is quit.
     @Published private(set) var headline: Double?
     /// While charging: minutes until full, from macOS.
     @Published private(set) var timeToFull: Double?
     @Published private(set) var apps: [AppDrain] = []
+    /// Eligible apps that don't fit in the pill, biggest draw first.
+    @Published private(set) var otherApps: [AppDrain] = []
     @Published private(set) var lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
     /// What's been won back by apps quit since the menu opened.
     @Published private(set) var sessionMinutes: Double = 0
@@ -50,25 +71,61 @@ final class DrainModel: ObservableObject {
     @Published var draggingID: String?
 
     /// While the menu is open the slices keep their place; only their numbers move.
-    var menuOpen = false
-    /// Called around the admin password prompt so the menu doesn't close under it.
+    /// Also sets the pace: fast while you're looking, slow otherwise.
+    var menuOpen = false {
+        didSet {
+            guard menuOpen != oldValue else { return }
+            if menuOpen {
+                // Counters are cleared here rather than on close, so a quit that is
+                // still pending when the menu closes keeps its credit until it settles.
+                if sessionStale { resetSession() }
+                // Fresh numbers right away, unless a sample has only just run.
+                schedule(fast: true)
+                if Date().timeIntervalSince(lastTickAt) > 1 { tick() }
+            } else {
+                sessionStale = true
+                schedule(fast: false)
+            }
+        }
+    }
+    /// Called when Drain needs the menu out of the way: the admin password prompt,
+    /// or an app that is still asking something after being told to quit.
     var modalHook: ((Bool) -> Void)?
 
-    private let sampler = EnergySampler()
-    private let coalitions = CoalitionSampler()
+    private let sampler = PowerSampler()
     private let queue = DispatchQueue(label: "drain.sampler", qos: .utility)
     private var timer: Timer?
+    private var watchdog: Timer?
+    private var powerSource: CFRunLoopSource?
+    private var powerTickPending = false
+    private var lastTickAt = Date.distantPast
     private var systemWatts: Double?
     private var remainingWh: Double = 0
     private var nativeTimeToEmpty: Double?
     private var nativeTimeToFull: Double?
+    /// See `RuntimeEstimate`. nil until macOS has given an estimate on battery.
+    private var calibration: Double?
+    private var lastQuitAt = Date.distantPast
     private var lastAccumulator: (sum: Double, count: Double)?
     private var appWatts: [String: Double] = [:]
     private var quitting: [String: Date] = [:]
+    private var pendingQuits: [String: PendingQuit] = [:]
+    private var sessionStale = false
+    private var sessionEpoch = 0
     private var colors: [String: Color] = [:]
     private var resolved: [String: String] = [:]
 
     private let maxSegments = 5
+    /// Seconds between samples with the menu open and closed. Closed, only the
+    /// icon is visible. The energy counters are cumulative, so a long gap still
+    /// averages correctly.
+    private let fastInterval = 2.0
+    private let slowInterval = 30.0
+    /// An app that hasn't quit this long after being asked is probably showing a
+    /// question; bring it forward. If it's still there after the longer wait, it
+    /// refused (or you cancelled) and the credit is taken back.
+    private let revealAfter = 3.0   // big apps take a couple of seconds to quit normally
+    private let giveUpAfter = 15.0
     /// Smoothing time constants, in seconds. Long enough that a spike from one
     /// busy moment doesn't swing the estimate.
     private let systemRiseTau = 8.0
@@ -77,6 +134,10 @@ final class DrainModel: ObservableObject {
     /// doesn't vanish the moment it pauses).
     private let appRiseTau = 5.0
     private let appFallTau = 30.0
+    /// How slowly the on-battery calibration follows macOS's estimate, and how
+    /// long it stays put after a quit while macOS's estimate catches up.
+    private let calibrationTau = 60.0
+    private let calibrationHold = 120.0
 
     func start() {
         NotificationCenter.default.addObserver(
@@ -84,8 +145,14 @@ final class DrainModel: ObservableObject {
         ) { [weak self] _ in
             onMainRunLoop { self?.lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled }
         }
+        watchPowerSource()
         tick()
-        let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+        schedule(fast: menuOpen)
+    }
+
+    private func schedule(fast: Bool) {
+        timer?.invalidate()
+        let timer = Timer(timeInterval: fast ? fastInterval : slowInterval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
         // Common modes, so it keeps ticking while the menu is open.
@@ -93,20 +160,38 @@ final class DrainModel: ObservableObject {
         self.timer = timer
     }
 
+    /// With the menu closed the slow timer would take up to 30 s to notice a
+    /// plug or unplug, so macOS tells us instead.
+    private func watchPowerSource() {
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        let callback: IOPowerSourceCallbackType = { context in
+            guard let context else { return }
+            let model = Unmanaged<DrainModel>.fromOpaque(context).takeUnretainedValue()
+            MainActor.assumeIsolated { model.powerSourceChanged() }
+        }
+        guard let source = IOPSNotificationCreateRunLoopSource(callback, context)?.takeRetainedValue() else { return }
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        powerSource = source
+    }
+
+    /// Plugging in fires a burst of notifications; one sample after it settles is enough.
+    private func powerSourceChanged() {
+        guard !powerTickPending else { return }
+        powerTickPending = true
+        onMainRunLoop(after: 0.5) { [weak self] in
+            self?.powerTickPending = false
+            self?.tick()
+        }
+    }
+
     private func tick() {
+        lastTickAt = Date()
         let running = quittableApps()
         let targets = running.map { (key: resolve($0.bundleURL!.path), pid: $0.processIdentifier) }
-        let sampler = self.sampler, coalitions = self.coalitions
+        let sampler = self.sampler
         queue.async {
-            let sample: (watts: [String: Double], seconds: Double)
-            if coalitions.available {
-                sample = coalitions.sample(targets)
-            } else {
-                // Fallback: attribute processes to the .app bundle they live in.
-                sample = sampler.sample()
-            }
-            let battery = BatteryReader.read()
-            onMainRunLoop { self.ingest(sample.watts, seconds: sample.seconds, battery, running: running) }
+            let sample = sampler.sample(targets)
+            onMainRunLoop { self.ingest(sample.watts, seconds: sample.seconds, sample.battery, running: running) }
         }
     }
 
@@ -149,8 +234,8 @@ final class DrainModel: ObservableObject {
         if let load, load > 0 {
             // Rises as quickly as app readings do, so an app can't briefly look
             // bigger than the whole Mac.
-            systemWatts = smooth(systemWatts, load, dt: seconds,
-                                 tau: load > (systemWatts ?? 0) ? systemRiseTau : systemFallTau)
+            systemWatts = BatteryMath.smooth(systemWatts, load, dt: seconds,
+                                             tau: load > (systemWatts ?? 0) ? systemRiseTau : systemFallTau)
         }
 
         // Per-app draw.
@@ -164,41 +249,63 @@ final class DrainModel: ObservableObject {
                 let key = resolve(app.bundleURL!.path)
                 let w = byBundle[key] ?? 0
                 let old = appWatts[key]
-                next[key] = smooth(old, w, dt: seconds, tau: w > (old ?? 0) ? appRiseTau : appFallTau)
+                next[key] = BatteryMath.smooth(old, w, dt: seconds, tau: w > (old ?? 0) ? appRiseTau : appFallTau)
             }
             appWatts = next
         }
 
+        trackCalibration(seconds: seconds)
         let now = Date()
         quitting = quitting.filter { now.timeIntervalSince($0.value) < 8 }
 
+        if timeToFull.map({ abs($0 - (nativeTimeToFull ?? -99)) >= 2 }) ?? (nativeTimeToFull != nil) {
+            timeToFull = nativeTimeToFull
+        }
+        publish(running: running, stateChanged: stateChanged, forceHeadline: false)
+    }
+
+    /// Keeps the on-battery factor close to macOS's estimate, slowly. It is left
+    /// alone just after a quit: macOS's estimate hasn't caught up with the lower
+    /// draw yet, and following it now would pull the headline straight back down.
+    private func trackCalibration(seconds: Double) {
+        guard state == .battery else { calibration = nil; return }
+        guard Date().timeIntervalSince(lastQuitAt) > calibrationHold, pendingQuits.isEmpty,
+              let raw = BatteryMath.calibration(native: nativeTimeToEmpty, remainingWh: remainingWh, watts: totalWatts)
+        else { return }
+        calibration = calibration.map { BatteryMath.smooth($0, raw, dt: seconds, tau: calibrationTau) } ?? raw
+    }
+
+    /// Turns the readings into what the menu shows: the slices, the overflow list, the headline.
+    private func publish(running: [NSRunningApplication], stateChanged: Bool, forceHeadline: Bool) {
         guard draggingID == nil else { return }
         let total = totalWatts
+        let hasEstimate = minutesLeft(at: total) != nil
 
         let candidates: [AppDrain] = running.compactMap { app in
             let key = resolve(app.bundleURL!.path)
-            guard quitting[key] == nil, let w = appWatts[key] else { return nil }
+            guard quitting[key] == nil, pendingQuits[key] == nil, let w = appWatts[key] else { return nil }
             return AppDrain(
                 id: key, pid: app.processIdentifier,
                 name: app.localizedName ?? (key as NSString).lastPathComponent,
                 icon: app.icon ?? NSWorkspace.shared.icon(forFile: key),
                 color: color(for: key, icon: app.icon),
                 watts: w, layoutWatts: w, gainMinutes: gain(removing: w, from: total),
-                hasEstimate: minutesLeft(at: total) != nil)
+                hasEstimate: hasEstimate)
         }
 
-        let listed = Set(apps.map(\.id))
+        let listed = Set(apps.map(\.id)).union(otherApps.map(\.id))
         // Easier to stay on than to get on, so apps hovering at the edge don't flicker.
         let eligible = candidates.filter { $0.watts >= (listed.contains($0.id) ? 0.01 : 0.03) }
         var nextApps: [AppDrain]
         if menuOpen && !stateChanged {
             // Slices you're looking at keep their place; only their numbers move.
             // Free spots can still fill up at the end.
+            let shown = Set(apps.map(\.id))
             let byID = Dictionary(uniqueKeysWithValues: candidates.map { ($0.id, $0) })
             nextApps = apps.compactMap { old in
                 byID[old.id].map { var a = $0; a.layoutWatts = old.layoutWatts; return a }
             }
-            let newcomers = eligible.filter { !listed.contains($0.id) }.sorted { $0.watts > $1.watts }
+            let newcomers = eligible.filter { !shown.contains($0.id) }.sorted { $0.watts > $1.watts }
             for app in newcomers {
                 if nextApps.count < maxSegments {
                     nextApps.append(app)
@@ -210,47 +317,17 @@ final class DrainModel: ObservableObject {
                 }
             }
         } else {
-            nextApps = Array(stableOrder(eligible).prefix(maxSegments))
+            nextApps = Array(BatteryMath.stableOrder(eligible, previous: apps.map(\.id)).prefix(maxSegments))
         }
+        let shownIDs = Set(nextApps.map(\.id))
+        let nextOthers = eligible.filter { !shownIDs.contains($0.id) }.sorted { $0.watts > $1.watts }
 
         let nextHeadline = minutesLeft(at: total)
-        if timeToFull.map({ abs($0 - (nativeTimeToFull ?? -99)) >= 2 }) ?? (nativeTimeToFull != nil) {
-            timeToFull = nativeTimeToFull
-        }
         withAnimation(.spring(response: 0.5, dampingFraction: 0.85)) {
-            if nextApps.map(\.id) != apps.map(\.id) || nextApps != apps { apps = nextApps }
-            if stateChanged || shouldMove(headline, to: nextHeadline) { headline = nextHeadline }
+            if nextApps != apps { apps = nextApps }
+            if nextOthers != otherApps { otherApps = nextOthers }
+            if stateChanged || forceHeadline || BatteryMath.shouldMove(headline, to: nextHeadline) { headline = nextHeadline }
         }
-    }
-
-    /// Biggest drain first, but neighbours only swap once one clearly overtakes the other.
-    private func stableOrder(_ candidates: [AppDrain]) -> [AppDrain] {
-        let previous = apps.map(\.id)
-        var ordered = candidates.sorted {
-            let a = previous.firstIndex(of: $0.id) ?? Int.max
-            let b = previous.firstIndex(of: $1.id) ?? Int.max
-            return a != b ? a < b : $0.watts > $1.watts
-        }
-        var swapped = true
-        while swapped {
-            swapped = false
-            for i in 0..<max(0, ordered.count - 1) where ordered[i + 1].watts > ordered[i].watts * 1.4 {
-                ordered.swapAt(i, i + 1)
-                swapped = true
-            }
-        }
-        return ordered
-    }
-
-    /// The big number only moves when the change is worth noticing.
-    private func shouldMove(_ old: Double?, to new: Double?) -> Bool {
-        guard let old, let new else { return (old == nil) != (new == nil) }
-        return abs(new - old) >= max(3, old * 0.03)
-    }
-
-    private func smooth(_ old: Double?, _ new: Double, dt: Double, tau: Double) -> Double {
-        guard let old, dt > 0 else { return new }
-        return old + (1 - exp(-dt / tau)) * (new - old)
     }
 
     // MARK: - Battery math
@@ -259,49 +336,129 @@ final class DrainModel: ObservableObject {
         systemWatts ?? (appWatts.values.reduce(0, +) + 5)
     }
 
-    /// Time left on battery at a given draw. On battery it's anchored to macOS's
-    /// own estimate so the number matches the system's. Plugged in, it's what the
-    /// charge in the battery would last at what the Mac is drawing right now.
-    private func minutesLeft(at watts: Double) -> Double? {
-        guard state != .noBattery, watts > 0.5 else { return nil }
-        let current = totalWatts
-        if state == .battery, let native = nativeTimeToEmpty, current > 0.5 { return native * current / watts }
-        guard remainingWh > 0 else { return nil }
-        return remainingWh / watts * 60
+    /// One rule in every state: charge / draw, scaled by `calibration` on battery
+    /// so it matches macOS's estimate in steady state. Plugged in it's the time
+    /// you'd have if you unplugged now.
+    private var estimate: RuntimeEstimate {
+        RuntimeEstimate(hasBattery: state != .noBattery, remainingWh: remainingWh,
+                        calibration: state == .battery ? (calibration ?? 1) : 1)
     }
 
+    private func minutesLeft(at watts: Double) -> Double? { estimate.minutesLeft(at: watts) }
+
     private func gain(removing w: Double, from total: Double) -> Double {
-        // Quitting one app can't take the Mac below a quarter of what it draws now
-        // (the display, radios and the system itself keep running).
-        let floor = max(0.6, total * 0.25)
-        guard let before = minutesLeft(at: total), let after = minutesLeft(at: max(floor, total - w)) else { return 0 }
-        return max(0, after - before)
+        estimate.gain(removing: w, from: total)
     }
 
     // MARK: - Actions
 
     func quit(_ app: AppDrain) {
-        quitting[app.id] = Date()
+        let now = Date()
+        quitting[app.id] = now
+        lastQuitAt = now
         appWatts[app.id] = nil
-        let gained = app.gainMinutes
-        if let sys = systemWatts { systemWatts = max(0.6, sys - app.watts) }
+        var removed = 0.0
+        if let sys = systemWatts {
+            let lowered = max(0.6, sys - app.watts)
+            removed = sys - lowered
+            systemWatts = lowered
+        }
         let total = totalWatts
 
-        withAnimation(.spring(response: 0.55, dampingFraction: 0.8)) {
-            sessionMinutes += gained
-            sessionWatts += app.watts
-            apps.removeAll { $0.id == app.id }
-            apps = apps.map { var a = $0; a.gainMinutes = gain(removing: a.watts, from: total); return a }
-            headline = minutesLeft(at: total)
-            draggingID = nil
-        }
         // Test runs set DRAIN_ONLY_QUIT to a bundle id so a mis-aimed drag can't quit a real app.
+        var refused = false
         if let only = ProcessInfo.processInfo.environment["DRAIN_ONLY_QUIT"],
            NSRunningApplication(processIdentifier: app.pid)?.bundleIdentifier != only {
             debugLog("refused to quit \(app.name) (DRAIN_ONLY_QUIT=\(only))")
-            return
+            refused = true
         }
-        Quitter.quit(pid: app.pid)
+
+        // Optimistic: the slice leaves and the numbers move now. The watchdog
+        // takes it all back if the app doesn't actually go.
+        pendingQuits[app.id] = PendingQuit(
+            app: app, sentAt: now, sent: !refused, creditMinutes: app.gainMinutes,
+            creditWatts: app.watts, removedWatts: removed, epoch: sessionEpoch)
+        withAnimation(.spring(response: 0.55, dampingFraction: 0.8)) {
+            sessionMinutes += app.gainMinutes
+            sessionWatts += app.watts
+            apps.removeAll { $0.id == app.id }
+            otherApps.removeAll { $0.id == app.id }
+            apps = apps.map { var a = $0; a.gainMinutes = gain(removing: a.watts, from: total); return a }
+            otherApps = otherApps.map { var a = $0; a.gainMinutes = gain(removing: a.watts, from: total); return a }
+            headline = minutesLeft(at: total)
+            draggingID = nil
+        }
+        startWatchdog()
+        if !refused { Quitter.quit(pid: app.pid) }
+    }
+
+    /// Checks every half second whether pending quits happened. Polling, because
+    /// notifications and KVO can stall while the menu is tracking; the timer runs
+    /// in common modes like the sampling one.
+    private func startWatchdog() {
+        guard watchdog == nil else { return }
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.checkPendingQuits() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        watchdog = timer
+    }
+
+    private func checkPendingQuits() {
+        let now = Date()
+        for (id, p) in pendingQuits {
+            if !isRunning(p.app) {
+                pendingQuits[id] = nil          // it went; the credit stands
+                continue
+            }
+            let age = now.timeIntervalSince(p.sentAt)
+            if p.sent, !p.revealed, age >= revealAfter {
+                pendingQuits[id]?.revealed = true
+                reveal(p.app)
+            }
+            if age >= (p.sent ? giveUpAfter : revealAfter) { rollBack(p) }
+        }
+        if pendingQuits.isEmpty { watchdog?.invalidate(); watchdog = nil }
+    }
+
+    /// Same process, still alive. (A pid can be reused, so the bundle is checked too.)
+    private func isRunning(_ app: AppDrain) -> Bool {
+        guard let r = NSRunningApplication(processIdentifier: app.pid), !r.isTerminated,
+              let url = r.bundleURL else { return false }
+        return resolve(url.path) == app.id
+    }
+
+    /// The app hasn't quit, so it's probably asking something ("Save changes?")
+    /// behind other windows. Bring it forward. The menu is closed too: while it's
+    /// open it would swallow the first click meant for the sheet. That's safe for
+    /// the numbers because the counters are cleared when the menu next opens, not
+    /// when it closes, so other quits keep their "won back" until then.
+    private func reveal(_ app: AppDrain) {
+        guard let r = NSRunningApplication(processIdentifier: app.pid) else { return }
+        modalHook?(true)
+        r.activate(options: [.activateAllWindows])
+        // Drain isn't frontmost, so macOS may ignore that; opening the app by URL
+        // is what a Dock click does and always brings it forward.
+        onMainRunLoop(after: 0.4) {
+            guard !r.isTerminated, !r.isActive, let url = r.bundleURL else { return }
+            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+        }
+    }
+
+    /// The quit didn't happen: take the credit back and let the slice return.
+    private func rollBack(_ p: PendingQuit) {
+        debugLog("quit of \(p.app.name) did not happen; rolling back")
+        pendingQuits[p.app.id] = nil
+        quitting[p.app.id] = nil
+        if let sys = systemWatts { systemWatts = sys + p.removedWatts }
+        appWatts[p.app.id] = p.app.watts
+        withAnimation(.spring(response: 0.5, dampingFraction: 0.85)) {
+            if p.epoch == sessionEpoch {
+                sessionMinutes = max(0, sessionMinutes - p.creditMinutes)
+                sessionWatts = max(0, sessionWatts - p.creditWatts)
+            }
+            publish(running: quittableApps(), stateChanged: false, forceHeadline: true)
+        }
     }
 
     func setLowPower(_ on: Bool) {
@@ -323,7 +480,12 @@ final class DrainModel: ObservableObject {
     }
 
     func menuClosed() {
-        menuOpen = false
+        menuOpen = false   // the counters are cleared when it next opens
+    }
+
+    private func resetSession() {
+        sessionStale = false
+        sessionEpoch += 1
         sessionMinutes = 0
         sessionWatts = 0
     }
@@ -362,29 +524,6 @@ func onMainRunLoop(after delay: TimeInterval, _ block: @escaping @MainActor () -
 func debugLog(_ message: @autoclosure () -> String) {
     guard ProcessInfo.processInfo.environment["DRAIN_DEBUG"] != nil else { return }
     FileHandle.standardError.write((message() + "\n").data(using: .utf8)!)
-}
-
-enum Format {
-    /// 220 → "3:40"
-    static func clock(_ minutes: Double) -> String {
-        let m = Int(minutes.rounded())
-        return String(format: "%d:%02d", m / 60, m % 60)
-    }
-
-    /// "−70m", "−40s"
-    static func cost(_ minutes: Double) -> String {
-        minutes >= 1 ? "−\(Int(minutes.rounded()))m" : "−\(max(1, Int((minutes * 60).rounded())))s"
-    }
-
-    /// "+70 min", "+40 sec"
-    static func gain(_ minutes: Double) -> String {
-        minutes >= 1 ? "+\(Int(minutes.rounded())) min" : "+\(max(1, Int((minutes * 60).rounded()))) sec"
-    }
-
-    /// "2.1 W", "0.3 W"
-    static func watts(_ w: Double) -> String {
-        w < 0.05 ? "<0.1 W" : w >= 10 ? String(format: "%.0f W", w) : String(format: "%.1f W", w)
-    }
 }
 
 enum IconColor {

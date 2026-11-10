@@ -163,8 +163,14 @@ final class CoalitionSampler: @unchecked Sendable {  // only used on the sampler
     private var last: [UInt64: [UInt64]] = [:]
     private var lastTime: UInt64 = 0
 
-    // Offsets into struct coalition_resource_usage (64-bit fields).
-    private static let fields = [11, 20, 21, 40, 41, 42]  // energy, billed to me/others; gpu energy, billed to me/others
+    // Offsets into struct coalition_resource_usage (64-bit fields), counted from XNU's
+    // osfmk/mach/coalition.h and checked against live readings on macOS 27.3.
+    // Index 40 is phys_footprint (bytes, goes up and down), so the GPU fields start at 41;
+    // reading 40-42 once counted memory growth as GPU energy.
+    private static let fields = [11, 20, 21, 41, 42, 43]  // energy, billed to me/others; gpu energy, billed to me/others
+    // cpu_time_eqos_len sits just before the layout starts to vary between releases and
+    // always equals the number of QoS buckets. If it isn't 7, the struct has moved.
+    private static let eqosLenIndex = 23, eqosLen: UInt64 = 7
 
     init() {
         let rtldDefault = UnsafeMutableRawPointer(bitPattern: -2)
@@ -186,7 +192,7 @@ final class CoalitionSampler: @unchecked Sendable {  // only used on the sampler
             guard let cid = Self.coalitionID(app.pid), current[cid] == nil else { continue }
             var buf = [UInt64](repeating: 0, count: 128)
             let rc = buf.withUnsafeMutableBytes { info(cid, $0.baseAddress!, $0.count) }
-            guard rc == 0 else { continue }
+            guard rc == 0, buf[Self.eqosLenIndex] == Self.eqosLen else { continue }
             let values = Self.fields.map { buf[$0] }
             current[cid] = values
 
@@ -228,6 +234,19 @@ enum LowPowerMode {
         return p.terminationStatus == 0
     }
 
+    /// Whether the rule file exists. A plain stat: the file is 0440 root, but /etc/sudoers.d
+    /// is searchable by everyone, so this needs no privileges and can't prompt or hang
+    /// (`sudo -n -l` would also say yes for any unrelated broader rule).
+    static var ruleInstalled: Bool { FileManager.default.fileExists(atPath: rulePath) }
+
+    /// Asks for your password and deletes exactly the rule file. Main thread only.
+    static func removeRule() -> Bool {
+        var error: NSDictionary?
+        NSAppleScript(source: "do shell script \"/bin/rm -f \(rulePath)\" with administrator privileges")?
+            .executeAndReturnError(&error)
+        return error == nil
+    }
+
     /// Asks for your password once, installs the rule, and sets the mode. Main thread only.
     static func installRuleAndSet(_ on: Bool) -> Bool {
         let value = on ? "1" : "0"
@@ -235,9 +254,14 @@ enum LowPowerMode {
         var script = "/usr/bin/pmset -a lowpowermode \(value)"
         if user.range(of: "^[A-Za-z0-9._-]+$", options: .regularExpression) != nil {
             let rule = "\(user) ALL=(root) NOPASSWD: /usr/bin/pmset -a lowpowermode 0, /usr/bin/pmset -a lowpowermode 1"
+            // The temp file lives in sudoers.d itself so the final mv is an atomic rename
+            // (a half-copied file there could break sudo). The ".tmp." in its name makes sudo
+            // ignore it. If any step fails the temp file is deleted; pmset runs regardless.
             script = """
-            t=$(/usr/bin/mktemp) && /bin/echo '\(rule)' > "$t" && /usr/sbin/visudo -cqf "$t" \
-            && /usr/sbin/chown root:wheel "$t" && /bin/chmod 0440 "$t" && /bin/mv "$t" \(rulePath); \
+            t=$(/usr/bin/mktemp /etc/sudoers.d/drain.tmp.XXXXXX) && \
+            { /usr/bin/printf '%s\\n' '\(rule)' > "$t" && /usr/sbin/visudo -cqf "$t" \
+            && /usr/sbin/chown root:wheel "$t" && /bin/chmod 0440 "$t" && /bin/mv "$t" \(rulePath); } \
+            || /bin/rm -f "$t"; \
             /usr/bin/pmset -a lowpowermode \(value)
             """
         }
@@ -246,5 +270,97 @@ enum LowPowerMode {
         NSAppleScript(source: "do shell script \"\(escaped)\" with administrator privileges")?
             .executeAndReturnError(&error)
         return error == nil
+    }
+}
+
+/// What DrainModel calls: per-app watts plus the battery reading, from whichever sampler
+/// can be trusted. Prefers coalitions (more complete); falls back to per-process rusage
+/// when coalitions are missing or their numbers can't be right, since they come from a
+/// private struct whose layout can change between macOS releases.
+final class PowerSampler: @unchecked Sendable {  // only used on the sampler queue
+    private enum Verdict { case fine, overshoot, silent, unknown }
+
+    private let coalitions = CoalitionSampler()
+    private let rusage = EnergySampler()
+    private var useCoalitions: Bool
+    private var overshoots = 0, silences = 0
+    private var retryAt: UInt64 = 0
+    private var retryDelay: Double = 600
+
+    init() { useCoalitions = coalitions.available }
+
+    func sample(_ targets: [(key: String, pid: pid_t)])
+        -> (watts: [String: Double], seconds: Double, battery: BatterySnapshot) {
+        if useCoalitions {
+            let r = coalitions.sample(targets)
+            let battery = BatteryReader.read()
+            // seconds == 0 is the first sample: nothing to judge yet.
+            if r.seconds > 0, isBroken(Self.verdict(r.watts, hasTargets: !targets.isEmpty, system: battery.systemWatts)) {
+                debugLog("coalition readings look wrong, falling back to rusage")
+                useCoalitions = false
+                scheduleRetry(doubling: false)
+                // The rusage sampler has nothing to diff against: seed it and take a short
+                // real window now, so the caller gets real numbers and a real `seconds`
+                // instead of an empty sample with seconds == 0.
+                _ = rusage.sample()
+                Thread.sleep(forTimeInterval: 1)
+                let w = rusage.sample()
+                return (w.watts, w.seconds, BatteryReader.read())
+            }
+            return (r.watts, r.seconds, battery)
+        }
+
+        let r = rusage.sample()
+        if r.seconds > 0, coalitions.available, DispatchTime.now().uptimeNanoseconds >= retryAt {
+            // Re-test coalitions instead of staying on rusage forever: a layout change can't
+            // heal while we run, but a false alarm (a power-reading glitch) can. The cost is
+            // one extra second, and the delay doubles after each failed retry up to an hour.
+            // The result of this probe is only judged, not returned; rusage numbers are used.
+            _ = coalitions.sample(targets)
+            Thread.sleep(forTimeInterval: 1)
+            let p = coalitions.sample(targets)
+            let battery = BatteryReader.read()
+            switch Self.verdict(p.watts, hasTargets: !targets.isEmpty, system: battery.systemWatts) {
+            case .fine:
+                debugLog("coalition readings plausible again, switching back")
+                useCoalitions = true
+                retryDelay = 600
+                overshoots = 0; silences = 0
+            case .unknown:
+                scheduleRetry(doubling: false)
+            case .overshoot, .silent:
+                scheduleRetry(doubling: true)
+            }
+            return (r.watts, r.seconds, battery)
+        }
+        return (r.watts, r.seconds, BatteryReader.read())
+    }
+
+    /// The apps together can't draw much more than the whole Mac, and a Mac with apps
+    /// running isn't drawing nothing. The two numbers cover slightly different windows, so
+    /// one bad sample proves nothing: it takes several in a row. Zeros need more, since an
+    /// idle machine really can read near zero for a while.
+    private func isBroken(_ v: Verdict) -> Bool {
+        switch v {
+        case .fine: overshoots = 0; silences = 0
+        case .overshoot: overshoots += 1; silences = 0
+        case .silent: silences += 1; overshoots = 0
+        case .unknown: break   // no system reading (desktop Mac, or briefly): keep the counts
+        }
+        return overshoots >= 3 || silences >= 6
+    }
+
+    private static func verdict(_ watts: [String: Double], hasTargets: Bool, system: Double?) -> Verdict {
+        guard hasTargets, let system else { return .unknown }
+        let sum = watts.values.reduce(0, +)
+        if sum > 2 * system + 1 { return .overshoot }
+        // Every reading rejected or exactly zero while the machine draws real power.
+        if sum < 0.001, system > 4 { return .silent }
+        return .fine
+    }
+
+    private func scheduleRetry(doubling: Bool) {
+        if doubling { retryDelay = min(retryDelay * 2, 3600) }
+        retryAt = DispatchTime.now().uptimeNanoseconds + UInt64(retryDelay * 1e9)
     }
 }

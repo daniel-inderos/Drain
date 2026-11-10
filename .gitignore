@@ -1,3 +1,8 @@
 .build/
 Drain.app/
+Drain.app.new/
 .DS_Store
+.swiftpm/
+xcuserdata/
+DerivedData/
+*.xcodeproj
