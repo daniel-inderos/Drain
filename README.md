@@ -12,6 +12,14 @@ Drain is a small macOS menu bar app that replaces the system battery menu. It sh
 
 Plugged in, the headline is how long the battery would last if you unplugged now, and the minutes per slice are measured against that.
 
+## Options
+
+Under "Settings" in the menu. All three are off until you turn them on.
+
+- **Show Time Left in Menu Bar** puts the time left (for example 3:40) beside the icon while on battery. Plugged in, or with no estimate yet, the icon is alone.
+- **Never Suggest Quitting** is a list of apps Drain should leave alone: no slice, not in the quit list, never named in a warning. Their power still counts in the Mac's total. Check an app to ignore it, choose it again to bring it back; ignored apps that aren't running stay listed. Stored by bundle identifier.
+- **Warn About Power-Hungry Apps** posts one notification when a single app has used at least 30% of the Mac's power and at least 3 W, with at least 20 minutes to be won back, continuously for 5 minutes on battery. The same app is not mentioned again for 4 hours, plugging in starts the 5 minutes over, and nothing is posted while Drain's menu is open. macOS is asked for notification permission when you turn this on, not before; if you decline, the option stays off. It needs the app bundle: a bare binary run from `.build/` never posts.
+
 ## Requirements
 
 macOS 15 or later and a Swift 6 toolchain (Xcode or the command line tools). It is a plain Swift package with no dependencies.

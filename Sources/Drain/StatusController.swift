@@ -14,6 +14,7 @@ final class StatusController: NSObject, NSMenuDelegate {
     private var header: NSHostingView<MenuView>?
     private var lowPowerRow: LowPowerRowView?
     private var quitApps: QuitAppsMenu?
+    private var settingsMenu: SettingsMenu?
     private var removeRuleItem: NSMenuItem?
     private var removingRule = false
     private var subscription: AnyCancellable?
@@ -84,6 +85,11 @@ final class StatusController: NSObject, NSMenuDelegate {
         self.quitApps = quitApps
         menu.addItem(quitApps.item)
 
+        let settingsMenu = SettingsMenu(model: model)
+        settingsMenu.onShowTimeChanged = { [weak self] in self?.refreshButton() }
+        self.settingsMenu = settingsMenu
+        menu.addItem(settingsMenu.item)
+
         let settings = NSMenuItem(title: "Battery Settings…", action: #selector(openSettings), keyEquivalent: "")
         settings.target = self
         settings.keyEquivalentModifierMask = []
@@ -145,6 +151,8 @@ final class StatusController: NSObject, NSMenuDelegate {
         }
     }
 
+    func verifyNotificationsStillAllowed() { settingsMenu?.verifyStillAllowed() }
+
     private func syncSwitch() {
         lowPowerRow?.isOn = model.lowPower
     }
@@ -153,12 +161,20 @@ final class StatusController: NSObject, NSMenuDelegate {
 
     private func refreshButton() {
         guard let button = item.button else { return }
-        let key = "\(model.percent)|\(model.state)|\(model.lowPower)"
+        // Only on battery with an estimate; plugged in it's the icon alone.
+        let time = model.settings.showTimeLeft && model.state == .battery
+            ? model.headline.map(Format.clock) ?? "" : ""
+        let key = "\(model.percent)|\(model.state)|\(model.lowPower)|\(time)"
         guard key != iconKey else { return }
         iconKey = key
         button.image = BatteryIcon.image(
             percent: model.state == .noBattery ? 100 : model.percent,
             pluggedIn: model.state.onAC, lowPower: model.lowPower)
-        button.setAccessibilityLabel("Battery \(model.percent) percent")
+        // Monospaced digits, so a changing digit doesn't change the item's width.
+        button.font = .monospacedDigitSystemFont(ofSize: NSFont.menuBarFont(ofSize: 0).pointSize, weight: .regular)
+        button.title = time
+        button.imagePosition = time.isEmpty ? .imageOnly : .imageLeading
+        button.setAccessibilityLabel(
+            time.isEmpty ? "Battery \(model.percent) percent" : "Battery \(model.percent) percent, \(time) left")
     }
 }

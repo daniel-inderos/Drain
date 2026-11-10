@@ -10,6 +10,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let drag = DragController(model: model)
         status = StatusController(model: model, drag: drag)
         model.start()
+        status?.verifyNotificationsStillAllowed()
         registerLoginItem()
     }
 

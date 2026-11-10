@@ -9,6 +9,8 @@ enum PowerState: Equatable {
 
 struct AppDrain: Identifiable, Equatable {
     let id: String          // resolved bundle path
+    /// What the ignore list is keyed by.
+    let bundleID: String?
     let pid: pid_t
     let name: String
     let icon: NSImage
@@ -69,6 +71,8 @@ final class DrainModel: ObservableObject {
     @Published private(set) var sessionMinutes: Double = 0
     @Published private(set) var sessionWatts: Double = 0
     @Published var draggingID: String?
+    /// Apps never suggested for quitting: bundle identifier -> display name.
+    @Published private(set) var ignoredApps: [String: String]
 
     /// While the menu is open the slices keep their place; only their numbers move.
     /// Also sets the pace: fast while you're looking, slow otherwise.
@@ -92,6 +96,8 @@ final class DrainModel: ObservableObject {
     /// or an app that is still asking something after being told to quit.
     var modalHook: ((Bool) -> Void)?
 
+    let settings: DrainSettings
+    private var hogWatcher = HogWatcher()
     private let sampler = PowerSampler()
     private let queue = DispatchQueue(label: "drain.sampler", qos: .utility)
     private var timer: Timer?
@@ -138,6 +144,11 @@ final class DrainModel: ObservableObject {
     /// long it stays put after a quit while macOS's estimate catches up.
     private let calibrationTau = 60.0
     private let calibrationHold = 120.0
+
+    init(settings: DrainSettings = DrainSettings()) {
+        self.settings = settings
+        ignoredApps = settings.ignoredApps
+    }
 
     func start() {
         NotificationCenter.default.addObserver(
@@ -262,6 +273,32 @@ final class DrainModel: ObservableObject {
             timeToFull = nativeTimeToFull
         }
         publish(running: running, stateChanged: stateChanged, forceHeadline: false)
+        watchForHog()
+    }
+
+    /// Feeds the sustained-draw watcher and posts its warning, if any.
+    private func watchForHog() {
+        guard settings.warnAboutHogs, HogNotifier.available else { return }
+        let total = totalWatts
+        let all = apps + otherApps
+        let hogs = all.map { PowerHog(id: $0.id, watts: $0.watts, gainMinutes: $0.hasEstimate ? $0.gainMinutes : 0) }
+        guard let id = hogWatcher.observe(at: Date().timeIntervalSince1970, onBattery: state == .battery,
+                                          menuOpen: menuOpen, systemWatts: total, apps: hogs),
+              let app = all.first(where: { $0.id == id }) else { return }
+        HogNotifier.shared.post(
+            title: "Drain",
+            body: Format.hogMessage(name: app.name, share: app.watts / total, gainMinutes: app.gainMinutes),
+            id: "hog-\(id)")
+    }
+
+    /// Adds or removes an app from the ignore list; the pill and lists follow at once.
+    func setIgnored(_ bundleID: String, name: String, _ ignored: Bool) {
+        var list = ignoredApps
+        if ignored { list[bundleID] = name } else { list[bundleID] = nil }
+        guard list != ignoredApps else { return }
+        ignoredApps = list
+        settings.ignoredApps = list
+        publish(running: quittableApps(), stateChanged: false, forceHeadline: false)
     }
 
     /// Keeps the on-battery factor close to macOS's estimate, slowly. It is left
@@ -284,8 +321,10 @@ final class DrainModel: ObservableObject {
         let candidates: [AppDrain] = running.compactMap { app in
             let key = resolve(app.bundleURL!.path)
             guard quitting[key] == nil, pendingQuits[key] == nil, let w = appWatts[key] else { return nil }
+            // Ignored apps still count in the whole-machine draw; they just aren't offered.
+            if let bundleID = app.bundleIdentifier, ignoredApps[bundleID] != nil { return nil }
             return AppDrain(
-                id: key, pid: app.processIdentifier,
+                id: key, bundleID: app.bundleIdentifier, pid: app.processIdentifier,
                 name: app.localizedName ?? (key as NSString).lastPathComponent,
                 icon: app.icon ?? NSWorkspace.shared.icon(forFile: key),
                 color: color(for: key, icon: app.icon),
