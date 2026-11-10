@@ -29,7 +29,7 @@ struct MenuView: View {
             BatteryPill(model: model, drag: drag)
                 .padding(.top, 12)
 
-            StatusRow(model: model)
+            StatusRow(model: model, drag: drag)
                 .padding(.top, 10)
         }
         .padding(.horizontal, 14)
@@ -51,8 +51,30 @@ struct MenuView: View {
 /// "Time left 3:40 +1:10" on battery; charging status on power.
 private struct StatusRow: View {
     @ObservedObject var model: DrainModel
+    @ObservedObject var drag: DragController
 
     var body: some View {
+        if let app = model.apps.first(where: { $0.id == drag.hintID }) {
+            hint(app)
+        } else {
+            status
+        }
+    }
+
+    /// After a click on a slice: what it is and what to do. Gone after a moment.
+    private func hint(_ app: AppDrain) -> some View {
+        let win = app.hasEstimate && app.gainMinutes >= 0.05 ? Format.gain(app.gainMinutes) : Format.watts(app.watts)
+        return HStack(spacing: 0) {
+            Text(app.name).lineLimit(1).truncationMode(.tail)
+            Text(" · drag out to quit · \(win)")
+                .foregroundStyle(.secondary).lineLimit(1).fixedSize()
+        }
+        .font(.system(size: 13)).monospacedDigit()
+        .frame(height: 18)
+        .transition(.opacity)
+    }
+
+    private var status: some View {
         HStack(spacing: 6) {
             Text(title).foregroundStyle(.secondary)
             Spacer()
@@ -126,6 +148,7 @@ struct BatteryPill: View {
                         // Only when it fits under its own slice, so neighbours never collide.
                         let label = app.costLabel
                         Text(CGFloat(label.count) * 6.4 <= w - 4 ? label : "")
+                            .accessibilityHidden(true)   // the slice itself says it
                             .font(.system(size: 10)).monospacedDigit()
                             .foregroundStyle(.secondary)
                             .lineLimit(1).fixedSize()
@@ -210,13 +233,19 @@ private struct Segment: View {
         }
         .frame(width: width)
         .overlay(alignment: .leading) { Rectangle().fill(Color.black.opacity(0.22)).frame(width: 1) }
+        // Read as one item. No "quit" action here: a custom action inside a menu's
+        // hosted view is unverified, and the native list below does that reliably.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(app.spokenSummary)
+        .accessibilityHint(app.spokenGain + (app.spokenGain.isEmpty ? "" : ". ") + "Use Quit an App to Save Power below to quit it.")
         .opacity(lifted ? 0.2 : 1)
         .onHover { h in withAnimation(.easeOut(duration: 0.15)) { hovering = h } }
         .help("\(app.name) · \(Format.watts(app.watts))")
         .overlay {
             DragCatcher(
                 onChange: { drag.changed(app, translation: $0) },
-                onEnd: { drag.ended() })
+                onEnd: { drag.ended() },
+                onClick: { drag.hint(app) })
         }
     }
 }
@@ -228,22 +257,26 @@ private struct Segment: View {
 private struct DragCatcher: NSViewRepresentable {
     let onChange: (CGSize) -> Void
     let onEnd: () -> Void
+    let onClick: () -> Void
 
     func makeNSView(context: Context) -> CatcherView {
         let view = CatcherView()
         view.onChange = onChange
         view.onEnd = onEnd
+        view.onClick = onClick
         return view
     }
 
     func updateNSView(_ view: CatcherView, context: Context) {
         view.onChange = onChange
         view.onEnd = onEnd
+        view.onClick = onClick
     }
 
     final class CatcherView: NSView {
         var onChange: ((CGSize) -> Void)?
         var onEnd: (() -> Void)?
+        var onClick: (() -> Void)?
 
         override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
@@ -262,7 +295,7 @@ private struct DragCatcher: NSViewRepresentable {
                 // Same convention as SwiftUI: x to the right, y downward.
                 let translation = CGSize(width: now.x - start.x, height: start.y - now.y)
                 if next.type == .leftMouseUp {
-                    if moving { onEnd?() }
+                    if moving { onEnd?() } else { onClick?() }
                     return
                 }
                 if moving || hypot(translation.width, translation.height) >= 3 {

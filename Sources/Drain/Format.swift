@@ -9,16 +9,18 @@ enum Format {
 
     /// "−70m", "−40s"
     static func cost(_ minutes: Double) -> String {
-        minutes >= 1 ? "−\(Int(minutes.rounded()))m" : "−\(max(1, Int((minutes * 60).rounded())))s"
+        let s = max(1, Int((minutes * 60).rounded()))
+        return minutes >= 1 || s >= 60 ? "−\(max(1, Int(minutes.rounded())))m" : "−\(s)s"
     }
 
     /// "+70 min", "+40 sec"
     static func gain(_ minutes: Double) -> String {
-        minutes >= 1 ? "+\(Int(minutes.rounded())) min" : "+\(max(1, Int((minutes * 60).rounded()))) sec"
+        let s = max(1, Int((minutes * 60).rounded()))
+        return minutes >= 1 || s >= 60 ? "+\(max(1, Int(minutes.rounded()))) min" : "+\(s) sec"
     }
 
     /// "2.1 W", "0.3 W"
     static func watts(_ w: Double) -> String {
-        w < 0.05 ? "<0.1 W" : w >= 10 ? String(format: "%.0f W", w) : String(format: "%.1f W", w)
+        w < 0.05 ? "<0.1 W" : w >= 9.95 ? String(format: "%.0f W", w) : String(format: "%.1f W", w)
     }
 }

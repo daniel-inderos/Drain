@@ -12,6 +12,9 @@ final class DragController: ObservableObject {
     @Published private(set) var armed = false
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var poofID = 0
+    /// The slice a plain click just explained; the status line shows it for a moment.
+    @Published private(set) var hintID: String?
+    private var hintToken = 0
 
     var closeMenu: (() -> Void)?
     private let model: DrainModel
@@ -38,6 +41,23 @@ final class DragController: ObservableObject {
         }
     }
 
+    /// A click that didn't become a drag. Clears itself, and `clearHint` is also
+    /// called when the menu opens or closes, so it can't stay on.
+    func hint(_ app: AppDrain) {
+        guard phase == .idle else { return }
+        hintToken += 1
+        let token = hintToken
+        withAnimation(.easeOut(duration: 0.15)) { hintID = app.id }
+        onMainRunLoop(after: 3.5) { [weak self] in
+            if self?.hintToken == token { self?.clearHint() }
+        }
+    }
+
+    func clearHint() {
+        hintToken += 1
+        if hintID != nil { withAnimation(.easeOut(duration: 0.15)) { hintID = nil } }
+    }
+
     func ended() {
         guard phase == .dragging, let app else { return }
         if armed {
@@ -59,6 +79,7 @@ final class DragController: ObservableObject {
     }
 
     private func begin(_ app: AppDrain, mouse: NSPoint, translation: CGSize) {
+        clearHint()
         origin = NSPoint(x: mouse.x - translation.width, y: mouse.y + translation.height)
         let screen = NSScreen.screens.first { $0.frame.contains(origin) } ?? NSScreen.main
         screenFrame = screen?.frame ?? .zero

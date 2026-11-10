@@ -34,6 +34,8 @@ final class LowPowerRowView: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     override func accessibilityValue() -> Any? { isOn ? 1 : 0 }
+    // Without this VoiceOver sees a checkbox it cannot press.
+    override func accessibilityPerformPress() -> Bool { onToggle?(); return true }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()

@@ -69,9 +69,12 @@ enum BatteryMath {
             let b = previous.firstIndex(of: $1.id) ?? Int.max
             return a != b ? a < b : $0.watts > $1.watts
         }
-        var swapped = true
-        while swapped {
+        // Capped at one pass per item: enough for any real input, and a negative
+        // reading (which would swap back and forth forever) can't hang the app.
+        var swapped = true, passes = 0
+        while swapped, passes <= ordered.count {
             swapped = false
+            passes += 1
             for i in 0..<max(0, ordered.count - 1) where ordered[i + 1].watts > ordered[i].watts * 1.4 {
                 ordered.swapAt(i, i + 1)
                 swapped = true

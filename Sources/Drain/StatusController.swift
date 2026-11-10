@@ -13,6 +13,9 @@ final class StatusController: NSObject, NSMenuDelegate {
     private let menu = NSMenu()
     private var header: NSHostingView<MenuView>?
     private var lowPowerRow: LowPowerRowView?
+    private var quitApps: QuitAppsMenu?
+    private var removeRuleItem: NSMenuItem?
+    private var removingRule = false
     private var subscription: AnyCancellable?
     private var iconKey = ""
 
@@ -35,6 +38,7 @@ final class StatusController: NSObject, NSMenuDelegate {
                 onMainRunLoop {
                     self?.refreshButton()
                     self?.syncSwitch()
+                    self?.quitApps?.refresh()
                 }
             }
         refreshButton()
@@ -75,6 +79,11 @@ final class StatusController: NSObject, NSMenuDelegate {
 
         menu.addItem(.separator())
 
+        // Quitting any app, not just the ones with a slice. Hidden when there are none.
+        let quitApps = QuitAppsMenu(model: model)
+        self.quitApps = quitApps
+        menu.addItem(quitApps.item)
+
         let settings = NSMenuItem(title: "Battery Settings…", action: #selector(openSettings), keyEquivalent: "")
         settings.target = self
         settings.keyEquivalentModifierMask = []
@@ -85,21 +94,54 @@ final class StatusController: NSObject, NSMenuDelegate {
         quit.keyEquivalentModifierMask = [.option]
         quit.isAlternate = true
         menu.addItem(quit)
+
+        // Option+Shift: take back the Low Power permission. Only offered while the rule exists.
+        let remove = NSMenuItem(title: "Remove Low Power Mode Permission…",
+                                action: #selector(removeLowPowerRule), keyEquivalent: "")
+        remove.target = self
+        remove.keyEquivalentModifierMask = [.option, .shift]
+        remove.isAlternate = true
+        remove.isHidden = !LowPowerMode.ruleInstalled
+        removeRuleItem = remove
+        menu.addItem(remove)
     }
 
     func menuWillOpen(_ menu: NSMenu) {
+        // Submenus report to their own delegates; this one only owns the main menu.
+        guard menu === self.menu else { return }
+        drag.clearHint()
+        removeRuleItem?.isHidden = !LowPowerMode.ruleInstalled
+        quitApps?.refresh()
         model.menuOpen = true
         if let header { header.frame.size = header.fittingSize }
         syncSwitch()
     }
 
     func menuDidClose(_ menu: NSMenu) {
+        guard menu === self.menu else { return }
+        drag.clearHint()
         model.menuClosed()
     }
 
     @objc private func openSettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.Battery-Settings.extension") {
             NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// The menu is already closed by the time a chosen item runs; the hook says so
+    /// again for safety, then the password prompt gets a moment to have the screen.
+    @objc private func removeLowPowerRule() {
+        guard !removingRule else { return }
+        removingRule = true
+        model.modalHook?(true)
+        onMainRunLoop(after: 0.35) { [weak self] in
+            // Cancelling the prompt or a failed delete both come back false; neither
+            // is reported as success, and the item stays offered while the file exists.
+            if !LowPowerMode.removeRule() { debugLog("sudoers rule not removed") }
+            self?.removingRule = false
+            self?.removeRuleItem?.isHidden = !LowPowerMode.ruleInstalled
+            self?.model.modalHook?(false)
         }
     }
 

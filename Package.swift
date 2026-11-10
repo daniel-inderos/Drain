@@ -9,6 +9,11 @@ let package = Package(
             name: "Drain",
             path: "Sources/Drain",
             linkerSettings: [.linkedFramework("IOKit")]
+        ),
+        .testTarget(
+            name: "DrainTests",
+            dependencies: ["Drain"],
+            path: "Tests/DrainTests"
         )
     ],
     swiftLanguageModes: [.v5]
