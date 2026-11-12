@@ -207,9 +207,9 @@ struct BatteryPill: View {
         let budget = max(floor * n, min(pillWidth * 0.5, n * 64))
         let extra = budget - floor * n
         let sum = apps.reduce(0) { $0 + $1.layoutWatts }
-        return Dictionary(uniqueKeysWithValues: apps.map {
+        return Dictionary(apps.map {
             ($0.id, floor + (sum > 0 ? extra * CGFloat($0.layoutWatts / sum) : extra / n))
-        })
+        }, uniquingKeysWith: { first, _ in first })
     }
 }
 

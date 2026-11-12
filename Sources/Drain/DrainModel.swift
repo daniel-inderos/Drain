@@ -318,9 +318,12 @@ final class DrainModel: ObservableObject {
         let total = totalWatts
         let hasEstimate = minutesLeft(at: total) != nil
 
+        // Two processes can come from the same bundle (an app launched twice, or via a
+        // symlink); they share one reading, so offer the bundle once.
+        var seen = Set<String>()
         let candidates: [AppDrain] = running.compactMap { app in
             let key = resolve(app.bundleURL!.path)
-            guard quitting[key] == nil, pendingQuits[key] == nil, let w = appWatts[key] else { return nil }
+            guard seen.insert(key).inserted, quitting[key] == nil, pendingQuits[key] == nil, let w = appWatts[key] else { return nil }
             // Ignored apps still count in the whole-machine draw; they just aren't offered.
             if let bundleID = app.bundleIdentifier, ignoredApps[bundleID] != nil { return nil }
             return AppDrain(
@@ -340,7 +343,7 @@ final class DrainModel: ObservableObject {
             // Slices you're looking at keep their place; only their numbers move.
             // Free spots can still fill up at the end.
             let shown = Set(apps.map(\.id))
-            let byID = Dictionary(uniqueKeysWithValues: candidates.map { ($0.id, $0) })
+            let byID = Dictionary(candidates.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             nextApps = apps.compactMap { old in
                 byID[old.id].map { var a = $0; a.layoutWatts = old.layoutWatts; return a }
             }
