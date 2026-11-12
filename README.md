@@ -12,11 +12,13 @@ Drain is a small macOS menu bar app that replaces the system battery menu. It sh
 
 Plugged in, the headline is how long the battery would last if you unplugged now, and the minutes per slice are measured against that.
 
+The line under the power source says what the charger is doing: "Charging at 38 W · Full in 1:20" with the rate going into the battery, "Holding at 80%" while macOS keeps the charge below full (Optimized Battery Charging, or a charge limit), and "Not Charging · Draining at 21 W" when the Mac is plugged in but the battery is still supplying power. While macOS is holding the charge, the menu has **Charge to Full Now**. It lifts the pause or limit for this charge only, as the same item in macOS's own battery menu does, and changes nothing in Battery settings; the line then reads "Charging to Full at 38 W · 0:49 left".
+
 ## Options
 
 Under "Settings" in the menu. All three are off until you turn them on.
 
-- **Show Time Left in Menu Bar** puts the time left (for example 3:40) beside the icon while on battery. Plugged in, or with no estimate yet, the icon is alone.
+- **Show Time in Menu Bar** puts a time (for example 3:40) beside the icon: the time left while on battery, the time until full while charging. Plugged in and not charging, or with no estimate yet, the icon is alone.
 - **Never Suggest Quitting** is a list of apps Drain should leave alone: no slice, not in the quit list, never named in a warning. Their power still counts in the Mac's total. Check an app to ignore it, choose it again to bring it back; ignored apps that aren't running stay listed. Stored by bundle identifier.
 - **Warn About Power-Hungry Apps** posts one notification when a single app has used at least 30% of the Mac's power and at least 3 W, with at least 20 minutes to be won back, continuously for 5 minutes on battery. The same app is not mentioned again for 4 hours, plugging in starts the 5 minutes over, and nothing is posted while Drain's menu is open. macOS is asked for notification permission when you turn this on, not before; if you decline, the option stays off. It needs the app bundle: a bare binary run from `.build/` never posts.
 
@@ -58,9 +60,12 @@ Whole-machine power draw and the energy left in the battery (capacity times volt
 
 On battery, the time left is macOS's own estimate scaled by the ratio of the current draw to the draw it would have without a given app, so the headline matches the system's number and each slice shows a proportional change. Plugged in, or when macOS has no estimate, it is the remaining watt-hours divided by the draw. Quitting one app is never assumed to take the machine below a floor of a quarter of its current draw, since the display and system keep running. These are estimates: they assume the draw stays what it is now.
 
+The time until full is macOS's own estimate. In the first minute of a charge, when macOS has none, and when charging toward a charge limit below 100%, Drain works it out from the rate going into the battery: constant up to 80%, tapering above it. That figure is rounded to 5 minutes.
+
 ## Caveats
 
 - The coalition energy counters come from a private kernel interface (`coalition_info_resource_usage`, looked up at runtime). It is undocumented and may change or disappear in a future macOS release; the per-process fallback is less accurate. The IORegistry battery keys are likewise not a public contract.
+- Reading whether macOS is holding the charge, and "Charge to Full Now", use the private `PowerUI` framework (`PowerUISmartChargeClient`, looked up at runtime). If it changes or goes away, the line falls back to "Not Charging" and the menu item does not appear.
 - Switching Low Power Mode needs root. The first time you use the toggle, macOS asks for your administrator password and Drain installs a sudoers rule at `/etc/sudoers.d/drain-lowpowermode`. The rule is for your user only and allows exactly two commands, `pmset -a lowpowermode 0` and `pmset -a lowpowermode 1`, without a password. To remove it:
 
       sudo rm /etc/sudoers.d/drain-lowpowermode

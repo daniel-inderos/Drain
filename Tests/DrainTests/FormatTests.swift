@@ -36,6 +36,41 @@ import Testing
         }
     }
 
+    @Test func chargeLine() {
+        func line(_ state: PowerState, _ time: Double?, _ watts: Double?, _ policy: ChargePolicy = ChargePolicy()) -> String? {
+            Format.chargeLine(state, percent: 82, timeToFull: time, batteryWatts: watts, policy: policy)
+        }
+        #expect(line(.charging, 80, 38.4) == "Charging at 38 W · Full in 1:20")
+        #expect(line(.charging, nil, 38.4) == "Charging at 38 W")
+        #expect(line(.charging, 80, nil) == "Charging · Full in 1:20")
+        // A trickle, or a reading that says "out" while macOS says charging, isn't a rate worth showing.
+        #expect(line(.charging, nil, 0.4) == "Charging")
+        #expect(line(.charging, nil, -5) == "Charging")
+        #expect(line(.charged, nil, 0) == "Fully Charged")
+        #expect(line(.onHold, nil, -21.4) == "Not Charging · Draining at 21 W")
+        #expect(line(.onHold, nil, -1) == "Not Charging")
+        #expect(line(.onHold, nil, nil) == "Not Charging")
+        #expect(line(.battery, nil, -12) == nil)
+        #expect(line(.noBattery, nil, nil) == nil)
+    }
+
+    @Test func chargeLineWithPolicy() {
+        func line(_ state: PowerState, _ time: Double?, _ watts: Double?, _ policy: ChargePolicy) -> String? {
+            Format.chargeLine(state, percent: 82, timeToFull: time, batteryWatts: watts, policy: policy)
+        }
+        let held = ChargePolicy(limited: true, limit: 80)
+        #expect(line(.onHold, nil, 0, held) == "Holding at 80%")
+        #expect(line(.onHold, nil, -21.4, held) == "Holding at 80% · Draining at 21 W")
+        // macOS didn't say where it stops: the level it is at now.
+        #expect(line(.onHold, nil, 0, ChargePolicy(limited: true)) == "Holding at 82%")
+        #expect(line(.charging, 20, 38, held) == "Charging to 80% at 38 W · 0:20 left")
+        #expect(line(.charging, nil, 38, ChargePolicy(limited: true)) == "Charging at 38 W")
+        let full = ChargePolicy(chargingToFull: true)
+        #expect(line(.charging, 49, 38, full) == "Charging to Full at 38 W · 0:49 left")
+        #expect(line(.charging, nil, nil, full) == "Charging to Full")
+        #expect(line(.charged, nil, 0, full) == "Fully Charged")
+    }
+
     @Test func watts() {
         #expect(Format.watts(0) == "<0.1 W")
         #expect(Format.watts(0.049) == "<0.1 W")

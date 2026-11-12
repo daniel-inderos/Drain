@@ -16,6 +16,7 @@ final class StatusController: NSObject, NSMenuDelegate {
     private var quitApps: QuitAppsMenu?
     private var settingsMenu: SettingsMenu?
     private var removeRuleItem: NSMenuItem?
+    private var chargeToFullItem: NSMenuItem?
     private var removingRule = false
     private var subscription: AnyCancellable?
     private var iconKey = ""
@@ -39,6 +40,7 @@ final class StatusController: NSObject, NSMenuDelegate {
                 onMainRunLoop {
                     self?.refreshButton()
                     self?.syncSwitch()
+                    self?.syncChargeToFull()
                     self?.quitApps?.refresh()
                 }
             }
@@ -63,6 +65,13 @@ final class StatusController: NSObject, NSMenuDelegate {
         let headerItem = NSMenuItem()
         headerItem.view = host
         menu.addItem(headerItem)
+
+        // Only there while macOS is holding the charge back, like its own menu.
+        let full = NSMenuItem(title: "Charge to Full Now", action: #selector(chargeToFull), keyEquivalent: "")
+        full.target = self
+        full.isHidden = true
+        chargeToFullItem = full
+        menu.addItem(full)
 
         menu.addItem(.separator())
 
@@ -121,6 +130,7 @@ final class StatusController: NSObject, NSMenuDelegate {
         model.menuOpen = true
         if let header { header.frame.size = header.fittingSize }
         syncSwitch()
+        syncChargeToFull()
     }
 
     func menuDidClose(_ menu: NSMenu) {
@@ -153,6 +163,13 @@ final class StatusController: NSObject, NSMenuDelegate {
 
     func verifyNotificationsStillAllowed() { settingsMenu?.verifyStillAllowed() }
 
+    @objc private func chargeToFull() { model.chargeToFull() }
+
+    private func syncChargeToFull() {
+        let offer = model.chargePolicy.limited && (model.state == .charging || model.state == .onHold)
+        if chargeToFullItem?.isHidden != !offer { chargeToFullItem?.isHidden = !offer }
+    }
+
     private func syncSwitch() {
         lowPowerRow?.isOn = model.lowPower
     }
@@ -161,9 +178,17 @@ final class StatusController: NSObject, NSMenuDelegate {
 
     private func refreshButton() {
         guard let button = item.button else { return }
-        // Only on battery with an estimate; plugged in it's the icon alone.
-        let time = model.settings.showTimeLeft && model.state == .battery
-            ? model.headline.map(Format.clock) ?? "" : ""
+        // Time left on battery, time until full while charging (the icon's bolt
+        // says which). Otherwise, or with no estimate yet, the icon alone.
+        var minutes: Double?
+        if model.settings.showTimeLeft {
+            switch model.state {
+            case .battery: minutes = model.headline
+            case .charging: minutes = model.timeToFull
+            default: break
+            }
+        }
+        let time = minutes.map(Format.clock) ?? ""
         let key = "\(model.percent)|\(model.state)|\(model.lowPower)|\(time)"
         guard key != iconKey else { return }
         iconKey = key
@@ -175,6 +200,7 @@ final class StatusController: NSObject, NSMenuDelegate {
         button.title = time
         button.imagePosition = time.isEmpty ? .imageOnly : .imageLeading
         button.setAccessibilityLabel(
-            time.isEmpty ? "Battery \(model.percent) percent" : "Battery \(model.percent) percent, \(time) left")
+            time.isEmpty ? "Battery \(model.percent) percent"
+                : "Battery \(model.percent) percent, \(time) \(model.state == .charging ? "until charged" : "left")")
     }
 }

@@ -24,6 +24,34 @@ enum Format {
         w < 0.05 ? "<0.1 W" : w >= 9.95 ? String(format: "%.0f W", w) : String(format: "%.1f W", w)
     }
 
+    /// The line under the power source while plugged in:
+    /// "Charging at 38 W · Full in 1:20", "Charging to Full at 38 W · 0:49 left",
+    /// "Holding at 80%". `batteryWatts` is what flows into the battery (positive)
+    /// or out of it (negative). Plugged in but not charging, the battery can still
+    /// be the one doing the work (a weak adapter, or macOS bringing the charge
+    /// down to its limit); that is said too.
+    static func chargeLine(_ state: PowerState, percent: Int, timeToFull: Double?, batteryWatts: Double?,
+                           policy: ChargePolicy = ChargePolicy()) -> String? {
+        switch state {
+        case .charged:
+            return "Fully Charged"
+        case .charging:
+            let rate = batteryWatts.flatMap { $0 >= 1 ? " at \(Int($0.rounded())) W" : nil } ?? ""
+            if policy.limited, let limit = policy.limit {
+                return "Charging to \(limit)%" + rate + (timeToFull.map { " · \(clock($0)) left" } ?? "")
+            }
+            if policy.chargingToFull {
+                return "Charging to Full" + rate + (timeToFull.map { " · \(clock($0)) left" } ?? "")
+            }
+            return "Charging" + rate + (timeToFull.map { " · Full in \(clock($0))" } ?? "")
+        case .onHold:
+            let drain = batteryWatts.flatMap { $0 <= -2 ? " · Draining at \(Int((-$0).rounded())) W" : nil } ?? ""
+            return (policy.limited ? "Holding at \(policy.limit ?? percent)%" : "Not Charging") + drain
+        case .battery, .noBattery:
+            return nil
+        }
+    }
+
     /// 0.33 → "about a third of", 0.41 → "about 40% of"
     static func shareOf(_ share: Double) -> String {
         let named: [(Double, String)] = [(0.25, "a quarter"), (1.0 / 3, "a third"), (0.5, "half"),

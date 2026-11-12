@@ -73,6 +73,12 @@ struct BatterySnapshot {
     /// Running totals the battery keeps; diffing them gives a steadier average than one reading.
     var loadAccumulator: Double?
     var loadSamples: Double?
+    /// Power flowing into the battery (positive) or out of it (negative), in watts.
+    var batteryWatts: Double?
+    /// Energy the battery holds when full, in watt-hours.
+    var fullWh: Double = 0
+    /// Only asked for while plugged in. nil when macOS doesn't say.
+    var policy: ChargePolicy?
 }
 
 enum BatteryReader {
@@ -110,11 +116,19 @@ enum BatteryReader {
             ?? number(batteryData["AppleRawCurrentCapacity"])
             ?? number(batteryData["RemainingCapacity"]) ?? 0
         snap.remainingWh = mAh * millivolts / 1e6
+        let fullmAh = number(d["AppleRawMaxCapacity"]) ?? number(batteryData["AppleRawMaxCapacity"])
+            ?? number(batteryData["FullChargeCapacity"]) ?? 0
+        snap.fullWh = fullmAh * millivolts / 1e6
+        if snap.hasBattery, snap.onAC { snap.policy = ChargeControl.read() }
 
         if let telemetry = d["PowerTelemetryData"] as? [String: Any] {
             if let load = number(telemetry["SystemLoad"]), load > 0 { snap.systemWatts = load / 1000 }
             snap.loadAccumulator = number(telemetry["AccumulatedSystemLoad"])
             snap.loadSamples = number(telemetry["SystemLoadAccumulatorCount"])
+        }
+        // The registry holds these as unsigned 64-bit; int64Value gives the sign back.
+        if let amps = (d["InstantAmperage"] ?? d["Amperage"]) as? NSNumber, millivolts > 0 {
+            snap.batteryWatts = Double(amps.int64Value) * millivolts / 1e6
         }
         if snap.systemWatts == nil,
            let amps = (d["InstantAmperage"] ?? d["Amperage"]) as? NSNumber, amps.int64Value < 0 {

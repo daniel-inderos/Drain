@@ -207,3 +207,59 @@ struct App: WattsRanked {
         #expect(ids(r) == ["p", "z"])
     }
 }
+
+@Suite struct ChargeTimeTests {
+    @Test func straightLineBelowTheKnee() {
+        // 20 Wh to add at 40 W.
+        #expect(BatteryMath.minutesToCharge(remainingWh: 20, fullWh: 100, to: 40, watts: 40) == 30)
+        #expect(BatteryMath.minutesToCharge(remainingWh: 20, fullWh: 100, to: 80, watts: 40) == 90)
+    }
+
+    @Test func slowerAboveTheKnee() throws {
+        // 80 to 100% takes a little over twice the straight-line 30 minutes.
+        let top = try #require(BatteryMath.minutesToCharge(remainingWh: 80, fullWh: 100, to: 100, watts: 40))
+        #expect(top == 65)
+        let whole = try #require(BatteryMath.minutesToCharge(remainingWh: 20, fullWh: 100, to: 100, watts: 40))
+        #expect(whole == 90 + 65)
+        // Already tapering: the rate measured now is the slow one, so less is added on top.
+        let late = try #require(BatteryMath.minutesToCharge(remainingWh: 90, fullWh: 100, to: 100, watts: 23))
+        #expect(late > 26 && late < 65)
+    }
+
+    @Test func nilWhenThereIsNothingToSay() {
+        #expect(BatteryMath.minutesToCharge(remainingWh: 80, fullWh: 100, to: 80, watts: 40) == nil)
+        #expect(BatteryMath.minutesToCharge(remainingWh: 90, fullWh: 100, to: 80, watts: 40) == nil)
+        #expect(BatteryMath.minutesToCharge(remainingWh: 50, fullWh: 100, to: 100, watts: 0.5) == nil)
+        #expect(BatteryMath.minutesToCharge(remainingWh: 50, fullWh: 100, to: 100, watts: nil) == nil)
+        #expect(BatteryMath.minutesToCharge(remainingWh: 50, fullWh: 0, to: 100, watts: 40) == nil)
+    }
+}
+
+@Suite struct ChargePolicyTests {
+    @Test func nothingSpecial() {
+        let p = ChargePolicy.from(optimizedPaused: false, pausedAt: 100, optimizedState: 1, limitState: 0, limitPercent: 100)
+        #expect(p == ChargePolicy())
+    }
+
+    @Test func optimizedChargingPaused() {
+        let p = ChargePolicy.from(optimizedPaused: true, pausedAt: 80, optimizedState: 1, limitState: 0, limitPercent: 100)
+        #expect(p == ChargePolicy(limited: true, limit: 80))
+        let unknown = ChargePolicy.from(optimizedPaused: true, pausedAt: 100, optimizedState: 1, limitState: 0, limitPercent: 100)
+        #expect(unknown == ChargePolicy(limited: true))
+    }
+
+    @Test func chargeLimit() {
+        let p = ChargePolicy.from(optimizedPaused: false, pausedAt: 100, optimizedState: 0, limitState: 1, limitPercent: 85)
+        #expect(p == ChargePolicy(limited: true, limit: 85))
+        // A "limit" of 100 is no limit.
+        let none = ChargePolicy.from(optimizedPaused: false, pausedAt: 100, optimizedState: 0, limitState: 1, limitPercent: 100)
+        #expect(none == ChargePolicy())
+    }
+
+    @Test func liftedForThisCharge() {
+        let p = ChargePolicy.from(optimizedPaused: false, pausedAt: 100, optimizedState: 3, limitState: 0, limitPercent: 100)
+        #expect(p == ChargePolicy(chargingToFull: true))
+        let limit = ChargePolicy.from(optimizedPaused: false, pausedAt: 100, optimizedState: 0, limitState: 3, limitPercent: 80)
+        #expect(limit == ChargePolicy(chargingToFull: true))
+    }
+}

@@ -20,9 +20,11 @@ struct MenuView: View {
                 .font(.system(size: 13)).foregroundStyle(.secondary)
                 .padding(.top, 3)
 
-            if let charge = chargeLine {
+            if let charge = Format.chargeLine(model.state, percent: model.percent, timeToFull: model.timeToFull,
+                                                 batteryWatts: model.batteryWatts, policy: model.chargePolicy) {
                 Text(charge)
                     .font(.system(size: 13)).foregroundStyle(.secondary).monospacedDigit()
+                    .lineLimit(1).minimumScaleFactor(0.85)
                     .padding(.top, 1)
             }
 
@@ -35,16 +37,6 @@ struct MenuView: View {
         .padding(.horizontal, 14)
         .padding(.top, 6).padding(.bottom, 4)
         .frame(width: 300)
-    }
-
-    /// The line macOS shows under the power source.
-    private var chargeLine: String? {
-        switch model.state {
-        case .charged: "Fully Charged"
-        case .charging: model.timeToFull.map { "Charging · Full in \(Format.clock($0))" } ?? "Charging"
-        case .onHold: "Not Charging"
-        case .battery, .noBattery: nil
-        }
     }
 }
 

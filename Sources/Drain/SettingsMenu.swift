@@ -13,13 +13,13 @@ final class SettingsMenu: NSObject, NSMenuDelegate {
     private let showTimeItem: NSMenuItem
     private let warnItem: NSMenuItem
     private var names: [String: String] = [:]   // bundle id -> name, as listed
-    /// Called after "Show Time Left in Menu Bar" changes.
+    /// Called after "Show Time in Menu Bar" changes.
     var onShowTimeChanged: (() -> Void)?
 
     init(model: DrainModel) {
         self.model = model
         settings = model.settings
-        showTimeItem = NSMenuItem(title: "Show Time Left in Menu Bar", action: #selector(toggleShowTime), keyEquivalent: "")
+        showTimeItem = NSMenuItem(title: "Show Time in Menu Bar", action: #selector(toggleShowTime), keyEquivalent: "")
         warnItem = NSMenuItem(title: "Warn About Power-Hungry Apps", action: #selector(toggleWarn), keyEquivalent: "")
         super.init()
         submenu.autoenablesItems = false

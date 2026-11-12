@@ -18,7 +18,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// › General › Login Items, Drain leaves it off.
     private func registerLoginItem() {
         let key = "didRegisterLoginItem"
-        guard !UserDefaults.standard.bool(forKey: key) else { return }
+        // Only the app bundle: a bare binary run from .build/ would register itself too.
+        guard Bundle.main.bundleURL.pathExtension == "app",
+              !UserDefaults.standard.bool(forKey: key) else { return }
         do {
             try SMAppService.mainApp.register()
             UserDefaults.standard.set(true, forKey: key)

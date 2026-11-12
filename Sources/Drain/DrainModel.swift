@@ -61,8 +61,13 @@ final class DrainModel: ObservableObject {
     /// Time left on battery: right now on battery, or if you unplugged now when
     /// plugged in. nil while unknown. Moves at once when an app is quit.
     @Published private(set) var headline: Double?
-    /// While charging: minutes until full, from macOS.
+    /// While charging: minutes until full (or until the charge limit). From macOS
+    /// when it has an estimate for that, otherwise worked out from the charge rate.
     @Published private(set) var timeToFull: Double?
+    /// What macOS is doing about filling the battery: holding it, or charging to full.
+    @Published private(set) var chargePolicy = ChargePolicy()
+    /// Whole watts going into the battery (positive) or coming out of it (negative).
+    @Published private(set) var batteryWatts: Double?
     @Published private(set) var apps: [AppDrain] = []
     /// Eligible apps that don't fit in the pill, biggest draw first.
     @Published private(set) var otherApps: [AppDrain] = []
@@ -107,8 +112,10 @@ final class DrainModel: ObservableObject {
     private var lastTickAt = Date.distantPast
     private var systemWatts: Double?
     private var remainingWh: Double = 0
+    private var fullWh: Double = 0
     private var nativeTimeToEmpty: Double?
     private var nativeTimeToFull: Double?
+    private var batteryFlow: Double?
     /// See `RuntimeEstimate`. nil until macOS has given an estimate on battery.
     private var calibration: Double?
     private var lastQuitAt = Date.distantPast
@@ -144,6 +151,7 @@ final class DrainModel: ObservableObject {
     /// long it stays put after a quit while macOS's estimate catches up.
     private let calibrationTau = 60.0
     private let calibrationHold = 120.0
+    private let batteryFlowTau = 10.0
 
     init(settings: DrainSettings = DrainSettings()) {
         self.settings = settings
@@ -231,6 +239,12 @@ final class DrainModel: ObservableObject {
         if stateChanged { state = newState }
         percent = battery.percent
         remainingWh = battery.remainingWh
+        fullWh = battery.fullWh
+        let policy = (newState.onAC ? battery.policy : nil) ?? ChargePolicy()
+        if policy != chargePolicy {
+            debugLog("charge policy: \(policy)")
+            chargePolicy = policy
+        }
         nativeTimeToEmpty = battery.timeToEmpty
         nativeTimeToFull = battery.timeToFull
 
@@ -269,11 +283,47 @@ final class DrainModel: ObservableObject {
         let now = Date()
         quitting = quitting.filter { now.timeIntervalSince($0.value) < 8 }
 
-        if timeToFull.map({ abs($0 - (nativeTimeToFull ?? -99)) >= 2 }) ?? (nativeTimeToFull != nil) {
-            timeToFull = nativeTimeToFull
+        trackBatteryFlow(battery.batteryWatts, seconds: seconds, restart: stateChanged)
+        let toFull = minutesToFull
+        if stateChanged || timeToFull.map({ abs($0 - (toFull ?? -99)) >= 2 }) ?? (toFull != nil) {
+            timeToFull = toFull
         }
         publish(running: running, stateChanged: stateChanged, forceHeadline: false)
         watchForHog()
+    }
+
+    /// The charge rate, smoothed, and shown in whole watts that only move once
+    /// the reading has really moved, so the line doesn't flicker between two values.
+    private func trackBatteryFlow(_ reading: Double?, seconds: Double, restart: Bool) {
+        if restart { batteryFlow = nil }
+        guard let reading else {
+            batteryFlow = nil
+            if batteryWatts != nil { batteryWatts = nil }
+            return
+        }
+        let flow = BatteryMath.smooth(batteryFlow, reading, dt: seconds, tau: batteryFlowTau)
+        batteryFlow = flow
+        if restart || batteryWatts.map({ abs(flow - $0) >= 1 }) ?? true { batteryWatts = flow.rounded() }
+    }
+
+    /// macOS's estimate is for a full battery. With a charge limit in force the
+    /// target is lower, and at first macOS has no estimate at all; both times
+    /// the charge rate gives one.
+    private var minutesToFull: Double? {
+        guard state == .charging else { return nil }
+        let limit = chargePolicy.limited ? chargePolicy.limit : nil
+        if limit == nil, let nativeTimeToFull { return nativeTimeToFull }
+        return BatteryMath.minutesToCharge(remainingWh: remainingWh, fullWh: fullWh, to: limit ?? 100, watts: batteryFlow)
+    }
+
+    /// Lifts macOS's pause or charge limit for this charge.
+    func chargeToFull() {
+        queue.async {
+            let ok = ChargeControl.chargeToFull()
+            debugLog("charge to full: \(ok ? "asked" : "failed")")
+            // The battery takes a moment to start; look once it has.
+            onMainRunLoop(after: 1.5) { self.tick() }
+        }
     }
 
     /// Feeds the sustained-draw watcher and posts its warning, if any.
