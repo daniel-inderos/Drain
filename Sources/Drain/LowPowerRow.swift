@@ -1,7 +1,7 @@
 import AppKit
 
 /// The "Low Power" row from macOS's own battery menu: a round button that fills
-/// with the accent color when on, the label beside it, and a soft highlight
+/// yellow when on, the label beside it, and a soft highlight
 /// across the row on hover. Clicking anywhere on the row toggles it and leaves
 /// the menu open, like the system's.
 final class LowPowerRowView: NSView {
@@ -68,10 +68,10 @@ final class LowPowerRowView: NSView {
         }
 
         let circle = NSRect(x: inset, y: (bounds.height - circleSize) / 2, width: circleSize, height: circleSize)
-        (isOn ? NSColor.controlAccentColor : NSColor.labelColor.withAlphaComponent(0.1)).setFill()
+        (isOn ? NSColor.systemYellow : NSColor.labelColor.withAlphaComponent(0.1)).setFill()
         NSBezierPath(ovalIn: circle).fill()
 
-        let tint: NSColor = isOn ? .white : .secondaryLabelColor
+        let tint: NSColor = isOn ? .black : .secondaryLabelColor
         let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .regular)
             .applying(.init(hierarchicalColor: tint))
         if let glyph = NSImage(systemSymbolName: "battery.50percent", accessibilityDescription: nil)?

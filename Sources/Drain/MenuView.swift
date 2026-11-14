@@ -103,7 +103,7 @@ private struct StatusRow: View {
     }
 }
 
-/// The battery itself: white is what you have, each colored slice is an app
+/// The battery itself: white (yellow in Low Power Mode) is what you have, each colored slice is an app
 /// eating into it. Grab a slice and pull it out to quit that app.
 struct BatteryPill: View {
     @ObservedObject var model: DrainModel
@@ -118,7 +118,9 @@ struct BatteryPill: View {
             VStack(spacing: 5) {
                 HStack(spacing: 0) {
                     ZStack {
-                        Color.white
+                        // Yellow in Low Power Mode, like the menu bar icon.
+                        (model.lowPower ? Color(nsColor: .systemYellow) : Color.white)
+                            .animation(.easeInOut(duration: 0.25), value: model.lowPower)
                         center
                     }
                     .frame(maxWidth: .infinity)

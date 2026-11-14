@@ -71,7 +71,9 @@ final class DrainModel: ObservableObject {
     @Published private(set) var apps: [AppDrain] = []
     /// Eligible apps that don't fit in the pill, biggest draw first.
     @Published private(set) var otherApps: [AppDrain] = []
-    @Published private(set) var lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+    @Published private(set) var lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled {
+        didSet { if lowPower != oldValue { lowPowerChanged() } }
+    }
     /// What's been won back by apps quit since the menu opened.
     @Published private(set) var sessionMinutes: Double = 0
     @Published private(set) var sessionWatts: Double = 0
@@ -119,6 +121,7 @@ final class DrainModel: ObservableObject {
     /// See `RuntimeEstimate`. nil until macOS has given an estimate on battery.
     private var calibration: Double?
     private var lastQuitAt = Date.distantPast
+    private var lastModeChangeAt = Date.distantPast
     private var lastAccumulator: (sum: Double, count: Double)?
     private var appWatts: [String: Double] = [:]
     private var quitting: [String: Date] = [:]
@@ -152,6 +155,10 @@ final class DrainModel: ObservableObject {
     private let calibrationTau = 60.0
     private let calibrationHold = 120.0
     private let batteryFlowTau = 10.0
+    /// After Low Power Mode is switched, the Mac's draw really has changed, so for
+    /// this long the reading is followed closely instead of being smoothed away.
+    private let modeSettle = 45.0
+    private let modeTau = 3.0
 
     init(settings: DrainSettings = DrainSettings()) {
         self.settings = settings
@@ -200,6 +207,23 @@ final class DrainModel: ObservableObject {
         onMainRunLoop(after: 0.5) { [weak self] in
             self?.powerTickPending = false
             self?.tick()
+        }
+    }
+
+    /// Low Power Mode changes what the whole Mac draws (dimmer display, slower
+    /// chips). The time left should show that as soon as it can be measured, not
+    /// minutes later once the smoothing and macOS's own estimate have caught up.
+    private func lowPowerChanged() {
+        lastModeChangeAt = Date()
+        // Close off the average taken under the old mode, so the samples after it
+        // cover the new mode only. Then look a few times while the draw settles;
+        // with the menu closed the next sample could be half a minute away.
+        tick()
+        for delay in [3.0, 8.0, 20.0] {
+            onMainRunLoop(after: delay) { [weak self] in
+                guard let self, Date().timeIntervalSince(self.lastTickAt) > 1 else { return }
+                self.tick()
+            }
         }
     }
 
@@ -259,8 +283,9 @@ final class DrainModel: ObservableObject {
         if let load, load > 0 {
             // Rises as quickly as app readings do, so an app can't briefly look
             // bigger than the whole Mac.
+            let settling = Date().timeIntervalSince(lastModeChangeAt) < modeSettle
             systemWatts = BatteryMath.smooth(systemWatts, load, dt: seconds,
-                                             tau: load > (systemWatts ?? 0) ? systemRiseTau : systemFallTau)
+                                             tau: settling ? modeTau : load > (systemWatts ?? 0) ? systemRiseTau : systemFallTau)
         }
 
         // Per-app draw.
@@ -352,11 +377,14 @@ final class DrainModel: ObservableObject {
     }
 
     /// Keeps the on-battery factor close to macOS's estimate, slowly. It is left
-    /// alone just after a quit: macOS's estimate hasn't caught up with the lower
-    /// draw yet, and following it now would pull the headline straight back down.
+    /// alone just after a quit or a Low Power Mode switch: macOS's estimate hasn't
+    /// caught up with the new draw yet, and following it now would pull the
+    /// headline straight back to where it was.
     private func trackCalibration(seconds: Double) {
         guard state == .battery else { calibration = nil; return }
-        guard Date().timeIntervalSince(lastQuitAt) > calibrationHold, pendingQuits.isEmpty,
+        let now = Date()
+        guard now.timeIntervalSince(lastQuitAt) > calibrationHold,
+              now.timeIntervalSince(lastModeChangeAt) > calibrationHold, pendingQuits.isEmpty,
               let raw = BatteryMath.calibration(native: nativeTimeToEmpty, remainingWh: remainingWh, watts: totalWatts)
         else { return }
         calibration = calibration.map { BatteryMath.smooth($0, raw, dt: seconds, tau: calibrationTau) } ?? raw
