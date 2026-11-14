@@ -28,6 +28,10 @@ macOS 15 or later and a Swift 6 toolchain (Xcode or the command line tools). It 
 
 ## Build and install
 
+There is no prebuilt download; you build Drain from source.
+
+    git clone https://github.com/daniel-inderos/Drain.git
+    cd Drain
     ./build.sh             # builds ./Drain.app
     ./build.sh --install   # also replaces /Applications/Drain.app and relaunches it
     ./build.sh --help
@@ -69,3 +73,15 @@ The time until full is macOS's own estimate. In the first minute of a charge, wh
 - Switching Low Power Mode needs root. The first time you use the toggle, macOS asks for your administrator password and Drain installs a sudoers rule at `/etc/sudoers.d/drain-lowpowermode`. The rule is for your user only and allows exactly two commands, `pmset -a lowpowermode 0` and `pmset -a lowpowermode 1`, without a password. To remove it:
 
       sudo rm /etc/sudoers.d/drain-lowpowermode
+
+## Privacy
+
+Drain makes no network connections and collects nothing. Its settings are stored in macOS user defaults on your Mac.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Security problems go through [SECURITY.md](SECURITY.md), not a public issue.
+
+## License
+
+[MIT](LICENSE)
