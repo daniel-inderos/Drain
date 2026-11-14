@@ -59,8 +59,15 @@ import Testing
             Format.chargeLine(state, percent: 82, timeToFull: time, batteryWatts: watts, policy: policy)
         }
         let held = ChargePolicy(limited: true, limit: 80)
-        #expect(line(.onHold, nil, 0, held) == "Holding at 80%")
-        #expect(line(.onHold, nil, -21.4, held) == "Holding at 80% · Draining at 21 W")
+        // Above the limit macOS runs on the battery to get down to it.
+        #expect(line(.onHold, nil, 0, held) == "Draining to 80%")
+        #expect(line(.onHold, nil, -12.2, held) == "Draining to 80% at 12 W")
+        // At the limit it holds.
+        func atLimit(_ watts: Double?) -> String? {
+            Format.chargeLine(.onHold, percent: 80, timeToFull: nil, batteryWatts: watts, policy: held)
+        }
+        #expect(atLimit(0) == "Holding at 80%")
+        #expect(atLimit(-21.4) == "Holding at 80% · Draining at 21 W")
         // macOS didn't say where it stops: the level it is at now.
         #expect(line(.onHold, nil, 0, ChargePolicy(limited: true)) == "Holding at 82%")
         #expect(line(.charging, 20, 38, held) == "Charging to 80% at 38 W · 0:20 left")

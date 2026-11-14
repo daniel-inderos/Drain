@@ -26,7 +26,7 @@ enum Format {
 
     /// The line under the power source while plugged in:
     /// "Charging at 38 W · Full in 1:20", "Charging to Full at 38 W · 0:49 left",
-    /// "Holding at 80%". `batteryWatts` is what flows into the battery (positive)
+    /// "Holding at 80%", "Draining to 80% at 12 W". `batteryWatts` is what flows into the battery (positive)
     /// or out of it (negative). Plugged in but not charging, the battery can still
     /// be the one doing the work (a weak adapter, or macOS bringing the charge
     /// down to its limit); that is said too.
@@ -45,7 +45,12 @@ enum Format {
             }
             return "Charging" + rate + (timeToFull.map { " · Full in \(clock($0))" } ?? "")
         case .onHold:
-            let drain = batteryWatts.flatMap { $0 <= -2 ? " · Draining at \(Int((-$0).rounded())) W" : nil } ?? ""
+            let draining = batteryWatts.flatMap { $0 <= -2 ? Int((-$0).rounded()) : nil }
+            // Above the limit macOS runs on the battery until it gets down to it.
+            if policy.limited, let limit = policy.limit, percent > limit {
+                return "Draining to \(limit)%" + (draining.map { " at \($0) W" } ?? "")
+            }
+            let drain = draining.map { " · Draining at \($0) W" } ?? ""
             return (policy.limited ? "Holding at \(policy.limit ?? percent)%" : "Not Charging") + drain
         case .battery, .noBattery:
             return nil

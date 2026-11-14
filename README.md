@@ -12,7 +12,7 @@ Drain is a small macOS menu bar app that replaces the system battery menu. It sh
 
 Plugged in, the headline is how long the battery would last if you unplugged now, and the minutes per slice are measured against that.
 
-The line under the power source says what the charger is doing: "Charging at 38 W · Full in 1:20" with the rate going into the battery, "Holding at 80%" while macOS keeps the charge below full (Optimized Battery Charging, or a charge limit), and "Not Charging · Draining at 21 W" when the Mac is plugged in but the battery is still supplying power. While macOS is holding the charge, the menu has **Charge to Full Now**. It lifts the pause or limit for this charge only, as the same item in macOS's own battery menu does, and changes nothing in Battery settings; the line then reads "Charging to Full at 38 W · 0:49 left".
+The line under the power source says what the charger is doing: "Charging at 38 W · Full in 1:20" with the rate going into the battery, "Holding at 80%" while macOS keeps the charge below full (Optimized Battery Charging, or a charge limit), "Draining to 80% at 12 W" while the charge is above that limit and macOS runs on the battery to bring it down, and "Not Charging · Draining at 21 W" when the Mac is plugged in but the battery is still supplying power. While macOS is holding the charge, the menu has **Charge to Full Now**. It lifts the pause or limit for this charge only, as the same item in macOS's own battery menu does, and changes nothing in Battery settings; the line then reads "Charging to Full at 38 W · 0:49 left".
 
 ## Options
 
